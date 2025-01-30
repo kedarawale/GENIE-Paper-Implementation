@@ -1,5 +1,4 @@
 # Install necessary packages if not already installed
-# Uncomment the following line to install the packages if needed
 # !pip install torch torchvision torchaudio torch-geometric node2vec scikit-learn tqdm
 
 import torch
