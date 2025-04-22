@@ -18,6 +18,8 @@ from torch_geometric.data import Data
 from sklearn.metrics import roc_auc_score
 from sklearn.neighbors import KernelDensity
 from collections import deque
+import torch.nn.utils.prune as prune
+from torch.quantization import quantize_dynamic
 
 ########################################################################
 # Hyperparameters & Device
@@ -403,6 +405,162 @@ def fine_tune_attack(model, train_data, device, epochs=50, lr=1e-4):
         optimizer.step()
     return attacked_model
 
+
+########################################################################
+#   Experiments 
+########################################################################
+
+
+def split_edge_data(data, frac=0.5):
+    """
+    Splits an edge-label Data object into two halves.
+    Returns two Data objects with the same x and edge_index but split edge_label_index and edge_label.
+    """
+    num = data.edge_label.size(0)
+    perm = torch.randperm(num)
+    h = num // 2
+    idx1, idx2 = perm[:h], perm[h:]
+    def make(d, idx):
+        return Data(x=d.x, edge_index=d.edge_index,
+                    edge_label_index=d.edge_label_index[:, idx],
+                    edge_label=d.edge_label[idx])
+    return make(data, idx1), make(data, idx2)
+
+# 5.A Impact of Model Extraction 
+def experiment_model_extraction(model, train_data, test_data, wm_data, device):
+    # Prepare split of test data
+    extract_data, eval_data = split_edge_data(test_data)
+    # Soft-label extraction
+    # Teacher logits on extract set
+    with torch.no_grad():
+        logits = model(extract_data.x.to(device), extract_data.edge_index.to(device), extract_data.edge_label_index.to(device))
+        soft_labels = torch.softmax(logits, dim=1)
+    # Train surrogate on soft labels
+    def train_surrogate(loss_fn, get_target):
+        sur = GCNModel(in_channels=train_data.x.size(1), hidden_channels=GCN_HIDDEN_DIM).to(device)
+        opt = torch.optim.Adam(sur.parameters(), lr=1e-3)
+        for _ in range(100):
+            sur.train(); opt.zero_grad()
+            out = sur(extract_data.x.to(device), extract_data.edge_index.to(device), extract_data.edge_label_index.to(device))
+            target = get_target(out, soft_labels)
+            loss = loss_fn(out, target)
+            loss.backward(); opt.step()
+        return sur
+    # Soft extraction
+    sur_soft = train_surrogate(F.cross_entropy, lambda out, sl: sl)
+    # Hard extraction
+    with torch.no_grad():
+        hard_labels = model(extract_data.x.to(device), extract_data.edge_index.to(device), extract_data.edge_label_index.to(device)).argmax(dim=1)
+    sur_hard = train_surrogate(F.cross_entropy, lambda out, tl: hard_labels)
+    # Double extraction
+    # First hard, then another surrogate
+    sur_double = train_surrogate(F.cross_entropy, lambda out, tl: sur_hard(extract_data.x.to(device), extract_data.edge_index.to(device), extract_data.edge_label_index.to(device)).argmax(dim=1))
+    # Evaluate all
+    for name, m in [('soft', sur_soft), ('hard', sur_hard), ('double', sur_double)]:
+        acc, auc = eval_model(m, eval_data, device)
+        wm_acc, wm_auc = eval_model(m, wm_data, device)
+        print(f"Extraction {name}: Eval AUC={auc:.4f}, WM AUC={wm_auc:.4f}")
+
+# 5.B Impact of Knowledge Distillation
+def experiment_knowledge_distillation(model, train_data, test_data, wm_data, device):
+    # Distil student with logits + ground truth
+    X, E, EL_idx = train_data.x, train_data.edge_index, train_data.edge_label_index
+    # Get teacher outputs
+    with torch.no_grad():
+        teacher_logits = model(X.to(device), E.to(device), EL_idx.to(device))
+    student = GCNModel(in_channels=X.size(1), hidden_channels=GCN_HIDDEN_DIM).to(device)
+    opt = torch.optim.Adam(student.parameters(), lr=1e-3)
+    for _ in range(200):
+        student.train(); opt.zero_grad()
+        out = student(X.to(device), E.to(device), EL_idx.to(device))
+        loss = F.kl_div(torch.log_softmax(out, dim=1), torch.softmax(teacher_logits, dim=1), reduction='batchmean')
+        loss.backward(); opt.step()
+    # Evaluate
+    acc, auc = eval_model(student, test_data, device)
+    wm_acc, wm_auc = eval_model(student, wm_data, device)
+    print(f"Knowledge Distillation: Test AUC={auc:.4f}, WM AUC={wm_auc:.4f}")
+
+# 5.C Impact of Model Fine-Tuning 
+def retrain_last_layer(model, train_data, device, epochs=50, lr=1e-4):
+    for p in model.parameters(): p.requires_grad = False
+    model.decoder.lin3.reset_parameters()
+    for p in model.decoder.lin3.parameters(): p.requires_grad = True
+    opt = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
+    for _ in range(epochs):
+        model.train(); opt.zero_grad()
+        logits = model(train_data.x.to(device), train_data.edge_index.to(device), train_data.edge_label_index.to(device))
+        loss = F.cross_entropy(logits, train_data.edge_label.long().to(device))
+        loss.backward(); opt.step()
+    return model
+
+def experiment_fine_tuning(model, train_data, test_data, wm_data, device):
+    # FTLL
+    m_ftll = retrain_last_layer(copy.deepcopy(model), train_data, device)
+    # RTLL: re-init last layer then FTLL
+    m_rtll = retrain_last_layer(copy.deepcopy(model), train_data, device)
+    # FTAL: fine-tune all
+    m_ftal = copy.deepcopy(model)
+    optimizer = torch.optim.Adam(m_ftal.parameters(), lr=1e-4)
+    for _ in range(50):
+        m_ftal.train(); optimizer.zero_grad()
+        out = m_ftal(train_data.x.to(device), train_data.edge_index.to(device), train_data.edge_label_index.to(device))
+        loss = F.cross_entropy(out, train_data.edge_label.long().to(device))
+        loss.backward(); optimizer.step()
+    # RTAL: re-init last layer + FTAL
+    for p in m_ftal.decoder.lin3.parameters(): p.data.normal_()
+    # Evaluate
+    for name, m in [('FTLL', m_ftll), ('RTLL', m_rtll), ('FTAL', m_ftal)]:
+        acc, auc = eval_model(m, test_data, device)
+        wm_acc, wm_auc = eval_model(m, wm_data, device)
+        print(f"Fine-Tune {name}: Test AUC={auc:.4f}, WM AUC={wm_auc:.4f}")
+
+# 5.D Impact of Model Pruning 
+def experiment_pruning(model, train_data, test_data, wm_data, device):
+    fractions = [0.2, 0.4, 0.6, 0.8]
+    for f in fractions:
+        m = copy.deepcopy(model)
+        for name, module in m.named_modules():
+            if isinstance(module, GCNConv):
+                prune.l1_unstructured(module, name='weight', amount=f)
+        acc, auc = eval_model(m, test_data, device)
+        wm_acc, wm_auc = eval_model(m, wm_data, device)
+        print(f"Prune {int(f*100)}%: Test AUC={auc:.4f}, WM AUC={wm_auc:.4f}")
+
+
+# 5.E Impact of Weight Quantization
+def experiment_quantization(model, train_data, test_data, wm_data, device):
+    model_cpu = copy.deepcopy(model).to('cpu')
+    try:
+        q_model = quantize_dynamic(model_cpu, {torch.nn.Linear}, dtype=torch.qint8)
+    except Exception as e:
+        print(f"Error during quantization: {e}")
+        return
+
+    test_data_cpu = test_data.to('cpu')
+    wm_data_cpu = wm_data.to('cpu')
+
+    try:
+        acc, auc = eval_model(q_model, test_data_cpu, 'cpu')
+        wm_acc, wm_auc = eval_model(q_model, wm_data_cpu, 'cpu')
+        # Use consistent formatting for the output
+        print(f"Quantized   → Dtest={auc*100:5.2f}%, Dwm={wm_auc*100:5.2f}%")
+    except Exception as e:
+        print(f"Error during evaluation of quantized model: {e}")
+        
+
+# 5.F Timing: Standard vs Watermark Training 
+def benchmark_training(train_data, wm_data, device):
+    m1 = GCNModel(train_data.x.size(1), GCN_HIDDEN_DIM).to(device)
+    opt1 = torch.optim.Adam(m1.parameters(), lr=1e-3)
+    t0 = time.time()
+    # standard one epoch
+    train_step(m1, opt1, train_data, wm_data, device)
+    t1 = time.time()
+    print(f"One epoch standard+watermark: {t1-t0:.4f}s")
+    
+    
+    
+
 ########################################################################
 # 10. Main (updated for CA-AstroPh dataset)
 ########################################################################
@@ -464,3 +622,278 @@ if __name__ == "__main__":
     # Judge tries to see if it's still watermarked:
     judge.dispute_ownership("AstroPh_GCNModelOwner", attacked_model, wm_data, # Updated owner name
                             clean_model_auc_dist, wm_model_auc_dist)
+    
+    # ==================================================
+    # ---           ROBUSTNESS EXPERIMENTS           ---
+    # ==================================================
+    print("\n\n--- Starting Robustness Experiments ---")
+
+    def subset(d, idxs):
+        ei = d.edge_label_index[:, idxs]
+        lbl = d.edge_label[idxs]
+        return Data(x=d.x, edge_index=d.edge_index,
+                    edge_label_index=ei, edge_label=lbl)
+
+    N = test_data.edge_label_index.size(1)
+    if N < 2:
+         print("WARN: Test data has too few edges to split for robustness tests.")
+         ext_train = test_data
+         ext_test = test_data
+    else:
+        perm = np.random.permutation(N)
+        mid = N // 2
+        ext_train = subset(test_data, perm[:mid])
+        ext_test  = subset(test_data, perm[mid:])
+
+    wm_model = copy.deepcopy(model).to(device)
+    _, initial_test_auc = eval_model(wm_model, test_data, device)
+    _, initial_wm_auc = eval_model(wm_model, wm_data, device)
+
+    # --- Define Helper Functions for Experiments --- ADDED ALL DEFINITIONS ---
+
+    # Model Extraction Functions
+    def extract_soft(teach):
+        stu = GCNModel(data_full.x.size(1), GCN_HIDDEN_DIM).to(device)
+        opt = torch.optim.Adam(stu.parameters(), lr=1e-3)
+        with torch.no_grad():
+             teach.eval()
+             t_log = teach(ext_train.x.to(device), ext_train.edge_index.to(device), ext_train.edge_label_index.to(device))
+             soft_labels = F.softmax(t_log, dim=1)
+        for _ in range(100): # Extraction epochs
+            stu.train(); opt.zero_grad()
+            s_log = stu(ext_train.x.to(device), ext_train.edge_index.to(device), ext_train.edge_label_index.to(device))
+            loss = F.kl_div(F.log_softmax(s_log, dim=1), soft_labels, reduction='batchmean')
+            loss.backward(); opt.step()
+        return stu
+
+    def extract_hard(teach):
+        stu = GCNModel(data_full.x.size(1), GCN_HIDDEN_DIM).to(device)
+        opt = torch.optim.Adam(stu.parameters(), lr=1e-3)
+        with torch.no_grad():
+            teach.eval()
+            hard_lbl = teach(ext_train.x.to(device), ext_train.edge_index.to(device), ext_train.edge_label_index.to(device)).argmax(dim=1)
+        for _ in range(100): # Extraction epochs
+            stu.train(); opt.zero_grad()
+            s_log = stu(ext_train.x.to(device), ext_train.edge_index.to(device), ext_train.edge_label_index.to(device))
+            loss = F.cross_entropy(s_log, hard_lbl)
+            loss.backward(); opt.step()
+        return stu
+
+    def extract_double(teach):
+        surrogate1 = extract_hard(teach)
+        stu = GCNModel(data_full.x.size(1), GCN_HIDDEN_DIM).to(device)
+        opt = torch.optim.Adam(stu.parameters(), lr=1e-3)
+        with torch.no_grad():
+             surrogate1.eval()
+             hard_lbl_sur1 = surrogate1(ext_train.x.to(device), ext_train.edge_index.to(device), ext_train.edge_label_index.to(device)).argmax(dim=1)
+        for _ in range(100): # Extraction epochs
+             stu.train(); opt.zero_grad()
+             s_log = stu(ext_train.x.to(device), ext_train.edge_index.to(device), ext_train.edge_label_index.to(device))
+             loss = F.cross_entropy(s_log, hard_lbl_sur1)
+             loss.backward(); opt.step()
+        return stu
+
+    # Knowledge Distillation Function
+    def knowledge_distill(teach, alpha=0.7): # Default alpha, adjust if needed
+        stu = GCNModel(data_full.x.size(1), GCN_HIDDEN_DIM).to(device)
+        opt = torch.optim.Adam(stu.parameters(), lr=1e-3)
+        # Get teacher logits once
+        with torch.no_grad():
+             teach.eval()
+             teacher_logits = teach(ext_train.x.to(device), ext_train.edge_index.to(device), ext_train.edge_label_index.to(device))
+        # Train student
+        for _ in range(200): # Distillation epochs (as per paper §5.4.2)
+            stu.train(); opt.zero_grad()
+            s_log = stu(ext_train.x.to(device), ext_train.edge_index.to(device), ext_train.edge_label_index.to(device))
+            y = ext_train.edge_label.long().to(device) # Ground truth labels
+            # Combine KL divergence (student vs teacher) and Cross Entropy (student vs ground truth)
+            loss_kl = F.kl_div(F.log_softmax(s_log, dim=1), F.softmax(teacher_logits, dim=1), reduction='batchmean')
+            loss_ce = F.cross_entropy(s_log, y)
+            loss = (1 - alpha) * loss_ce + alpha * loss_kl
+            loss.backward(); opt.step()
+        return stu
+
+    # Fine-Tuning Functions
+    def finetune_last_layer(m0, reinit=False):
+        m = copy.deepcopy(m0).to(device)
+        # Freeze all layers except the last one in the decoder
+        for param in m.parameters(): param.requires_grad = False
+        last_layer = m.decoder.lin3 # Assuming lin3 is the final layer
+        if reinit:
+             last_layer.reset_parameters()
+        for param in last_layer.parameters(): param.requires_grad = True
+        # Optimize only the unfrozen layer
+        opt = torch.optim.Adam(filter(lambda p: p.requires_grad, m.parameters()), lr=1e-4)
+        for _ in range(50): # Fine-tuning epochs (as per paper §5.4.3)
+            m.train(); opt.zero_grad()
+            log = m(ext_train.x.to(device), ext_train.edge_index.to(device), ext_train.edge_label_index.to(device))
+            loss = F.cross_entropy(log, ext_train.edge_label.long().to(device))
+            loss.backward(); opt.step()
+        # Unfreeze all layers after fine-tuning if needed elsewhere, though not necessary here
+        # for param in m.parameters(): param.requires_grad = True
+        return m
+
+    def finetune_all(m0, reinit_last=False):
+        m = copy.deepcopy(m0).to(device)
+        # Ensure all layers are trainable
+        for param in m.parameters(): param.requires_grad = True
+        if reinit_last:
+             m.decoder.lin3.reset_parameters() # Reinitialize last layer if RTAL/FTAL
+        opt = torch.optim.Adam(m.parameters(), lr=1e-4)
+        for _ in range(50): # Fine-tuning epochs (as per paper §5.4.3)
+            m.train(); opt.zero_grad()
+            log = m(ext_train.x.to(device), ext_train.edge_index.to(device), ext_train.edge_label_index.to(device))
+            loss = F.cross_entropy(log, ext_train.edge_label.long().to(device))
+            loss.backward(); opt.step()
+        return m
+
+    # Pruning Function --- CORRECTED ---
+    def prune_frac(m0, frac):
+        pruned_model = copy.deepcopy(m0)
+        parameters_to_prune = []
+        # Identify parameters to prune
+        for module in pruned_model.modules():
+            if isinstance(module, torch.nn.Linear):
+                # Target weight and bias of standard Linear layers
+                parameters_to_prune.append((module, 'weight'))
+                if module.bias is not None:
+                     parameters_to_prune.append((module, 'bias'))
+            elif isinstance(module, GCNConv):
+                # Target weight and bias of the internal Linear layer within GCNConv
+                # PyG's GCNConv typically has a 'lin' attribute for the Linear layer
+                # Or sometimes the parameter is directly accessible (less common now)
+                # We'll assume 'lin' exists, otherwise this needs adjustment based on GCNConv implementation
+                if hasattr(module, 'lin') and isinstance(module.lin, torch.nn.Linear):
+                     parameters_to_prune.append((module.lin, 'weight'))
+                     if module.lin.bias is not None:
+                          parameters_to_prune.append((module.lin, 'bias'))
+                # Add checks for other possible GCNConv internal parameter names if needed
+
+        if not parameters_to_prune:
+             print("WARN: No parameters identified for pruning.")
+             return pruned_model
+
+        # Apply global unstructured pruning
+        try:
+            prune.global_unstructured(
+                parameters_to_prune,
+                pruning_method=prune.L1Unstructured,
+                amount=frac,
+            )
+            # Make pruning permanent
+            for module, name in parameters_to_prune:
+                 # Check if the target module (could be module.lin) exists and has the hook
+                 target_module = module # Default to the module itself
+                 # If name is 'weight' or 'bias', the module is likely the one holding it directly
+                 # Need to handle the case where we targeted module.lin
+                 if '.' in name: # Simple check if we targeted an attribute like 'lin.weight' - THIS IS NOT ROBUST
+                      # This part is tricky, prune.remove needs the original module and the parameter name
+                      # Let's stick to targeting the direct module for prune.remove
+                      # The parameters_to_prune list holds tuples like (LinearLayer, 'weight')
+                      pass # The module in the tuple is the correct one
+
+                 # Check if pruning was actually applied before removing
+                 if prune.is_pruned(target_module):
+                      # Check if the specific parameter 'name' is pruned if possible (depends on PyTorch version)
+                      # Safest is to just attempt removal if the module has hooks
+                      try:
+                           prune.remove(target_module, name)
+                      except ValueError: # Parameter name might not be directly prunable this way
+                           # This can happen if pruning hooks are attached differently
+                           # Or if the parameter wasn't actually pruned (e.g., amount=0)
+                           # print(f"Note: Could not remove pruning hook for {name} on {type(target_module)}")
+                           pass # Continue even if removal fails for one parameter
+                      except Exception as e_rem:
+                           print(f"Error removing prune hook for {name} on {type(target_module)}: {e_rem}")
+
+        except RuntimeError as e_prune:
+             print(f"Error during pruning: {e_prune}")
+             print("Parameters targeted:")
+             for mod, nm in parameters_to_prune:
+                  print(f" - Module: {type(mod)}, Name: {nm}")
+             # Return the original model if pruning fails
+             return m0
+        except Exception as e_other:
+             print(f"Unexpected error during pruning: {e_other}")
+             return m0
+
+        return pruned_model
+
+    # --- End Define Helper Functions ---
+
+
+    print(f"\n--- Model Extraction ---")
+    print(f"No attack   → Dtest={initial_test_auc*100:5.2f}%, Dwm={initial_wm_auc*100:5.2f}%")
+    for name, fn in [("Soft", extract_soft), ("Hard", extract_hard), ("Double", extract_double)]:
+        stolen = fn(wm_model)
+        dtest_auc = eval_model(stolen, ext_test, device)[1]*100
+        dwm_auc   = eval_model(stolen, wm_data, device)[1]*100
+        print(f"Extract {name:>6} → Dtest={dtest_auc:5.2f}%, Dwm={dwm_auc:5.2f}%")
+
+    print(f"\n--- Knowledge Distillation ---")
+    kd_model = knowledge_distill(wm_model)
+    dtest_auc_kd = eval_model(kd_model, ext_test, device)[1]*100
+    dwm_auc_kd = eval_model(kd_model, wm_data, device)[1]*100
+    print(f"Distilled   → Dtest={dtest_auc_kd:5.2f}%, Dwm={dwm_auc_kd:5.2f}%")
+
+    print(f"\n--- Model Fine-Tuning ---")
+    _, initial_ext_test_auc = eval_model(wm_model, ext_test, device)
+    print(f"No tuning   → Dtest={initial_ext_test_auc*100:5.2f}%, Dwm={initial_wm_auc*100:5.2f}%")
+    for name, fn in [("FTLL", lambda: finetune_last_layer(wm_model, False)),
+                     ("RTLL", lambda: finetune_last_layer(wm_model, True)),
+                     ("FTAL", lambda: finetune_all(wm_model, False)),
+                     ("RTAL", lambda: finetune_all(wm_model, True))]:
+        atk = fn()
+        dtest_auc_ft = eval_model(atk, ext_test, device)[1]*100
+        dwm_auc_ft = eval_model(atk, wm_data, device)[1]*100
+        print(f"Tune {name:>5} → Dtest={dtest_auc_ft:5.2f}%, Dwm={dwm_auc_ft:5.2f}%")
+
+    print(f"\n--- Model Pruning ---")
+    print(f"Prune   0%  → Dtest={initial_test_auc*100:5.2f}%, Dwm={initial_wm_auc*100:5.2f}%")
+    for frac in [0.2, 0.4, 0.6, 0.8]:
+        pm = prune_frac(wm_model, frac) # Use the corrected prune_frac
+        dtest_auc_prune = eval_model(pm, test_data, device)[1]*100 # Evaluate on full test set
+        dwm_auc_prune = eval_model(pm, wm_data, device)[1]*100
+        print(f"Prune {int(frac*100):>3d}% → Dtest={dtest_auc_prune:5.2f}%, Dwm={dwm_auc_prune:5.2f}%")
+
+    print(f"\n--- Weight Quantization ---")
+    try:
+        experiment_quantization(wm_model, train_data, test_data, wm_data, device)
+    except Exception as e_quant:
+        print(f"Error during quantization experiment: {e_quant}")
+
+
+    print(f"\n--- Fine-Pruning (RTAL) ---")
+    for frac in [0.2, 0.4, 0.6, 0.8]:
+        pm = prune_frac(wm_model, frac) # Use the corrected prune_frac
+        atk = finetune_all(pm, reinit_last=True) # Use the fine-tune all function
+        dtest_auc_fp = eval_model(atk, ext_test, device)[1]*100 # Evaluate on ext_test
+        dwm_auc_fp = eval_model(atk, wm_data, device)[1]*100
+        print(f"P+RTAL {int(frac*100):>3d}% → Dtest={dtest_auc_fp:5.2f}%, Dwm={dwm_auc_fp:5.2f}%")
+
+    print(f"\n--- Training Time Comparison ---")
+    # Time clean model training
+    clean_m_time = GCNModel(data_full.x.size(1), GCN_HIDDEN_DIM).to(device)
+    opt_c_time = torch.optim.Adam(clean_m_time.parameters(), lr=1e-3)
+    t0 = time.time()
+    for _ in range(EPOCHS):
+        clean_m_time.train(); opt_c_time.zero_grad()
+        lg = clean_m_time(train_data.x.to(device), train_data.edge_index.to(device), train_data.edge_label_index.to(device))
+        loss = F.cross_entropy(lg, train_data.edge_label.long().to(device))
+        loss.backward()
+        opt_c_time.step()
+    t_clean = time.time() - t0
+
+    # Time watermarked model training
+    wm_m_time = GCNModel(data_full.x.size(1), GCN_HIDDEN_DIM).to(device)
+    opt_wm_time = torch.optim.Adam(wm_m_time.parameters(), lr=1e-3)
+    t1 = time.time()
+    for _ in range(EPOCHS): 
+        train_step(wm_m_time, opt_wm_time, train_data, wm_data, device)
+    t_wm = time.time() - t1
+
+    print(f"Standard Training Time : {t_clean:.1f}s")
+    print(f"Watermark Training Time: {t_wm:.1f}s")
+    print(f"Overhead Factor        : {t_wm / t_clean:.2f}x" if t_clean > 0 else "N/A (Clean time is zero)")
+
+    print("\n--- Experiments Completed ---")
