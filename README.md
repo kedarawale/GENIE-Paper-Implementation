@@ -113,6 +113,7 @@ python gcn.py
 (Repeat similarly for other models like `graphsage.py`, `neognn.py`, `seal.py` within their respective dataset directories.)
 
 ### Running Experiments
+**Note : Run all the experiments for 10 times and get the average of them to get the expected results in the paper**
 
 To run a specific robustness experiment (attack evaluation), navigate to the `experiments` subdirectory within the desired dataset's folder and run the corresponding experiment script. These scripts usually load a pre-trained watermarked model (trained by the base model script) and evaluate its watermark under the specific attack.
 
