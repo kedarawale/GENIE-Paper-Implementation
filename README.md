@@ -67,7 +67,22 @@ GENIE-Paper-Implementation/
 
 - **Dataset Directories (e.g., `yeast/`, `usair97/`)**: Each contains the raw data file(s) and Python scripts for specific GNN models (GCN, GraphSAGE, NeoGNN, SEAL) adapted for that dataset.  
 - **Model Scripts (e.g., `yeast/gcn.py`)**: These scripts typically handle data loading, Node2Vec embedding generation (if not pre-computed), model definition, training a watermarked model, and basic evaluation. Running these directly often trains the base watermarked model for the respective dataset and GNN architecture.  
-- **Experiment Subdirectories (e.g., `yeast/experiments/`)**: Contain scripts to run specific attack evaluations (Extraction, Fine-tuning, Pruning, etc.) against the pre-trained watermarked models.  
+- **Experiment Subdirectories (e.g., `yeast/experiments/`)**: Contain scripts to run specific attack evaluations (Extraction, Fine-tuning, Pruning, etc.) against the 
+pre-trained watermarked models.  
+
+#### Experiments Scripts Location
+
+All the experiment scripts are located inside the `experiments/` subdirectory for each dataset:
+
+```
+GENIE-Paper-Implementation/
+├── yeast/experiments/
+├── usair97/experiments/
+├── biogrid/experiments/
+├── astroph/experiments/
+└── inf-power/experiments/
+
+```
 
 ## Running the Code
 
@@ -116,3 +131,292 @@ python finetuning.py
 ```
 
 (Follow this pattern for other experiments like `knowledgedistillation.py`, `pruning.py`, etc., within the relevant experiments directory.)
+
+### Experiment - Model Extraction Attack (Table 6 & Table 7)
+
+
+#### How to Run the Scripts
+
+```bash
+# Yeast Dataset
+cd yeast/experiments
+python extraction.py
+
+# USAir97 Dataset
+cd ../../usair97/experiments
+python extraction.py
+
+# BioGRID Dataset
+cd ../../biogrid/experiments
+python extraction.py
+
+# AstroPh Dataset
+cd ../../astroph/experiments
+python extraction.py
+
+# Power Grid Dataset
+cd ../../inf-power/experiments
+python extraction.py
+```
+
+#### Output Format
+
+```bash
+--- Model Extraction ---
+No attack        → Dtest=97.44%, Dwm=96.54%
+Extract   Soft   → Dtest=88.87%, Dwm=18.41%
+Extract   Hard   → Dtest=88.96%, Dwm=16.13%
+Extract Double   → Dtest=87.54%, Dwm=56.22%
+
+```
+
+
+### Experiment - Timing Evaluation (Watermark Overhead)
+
+#### How to Run the Scripts
+
+```bash
+# Yeast Dataset
+cd yeast/experiments
+python timing.py
+
+# USAir97 Dataset
+cd usair97/experiments
+python timing.py
+
+# BioGRID Dataset
+cd biogrid/experiments
+python timing.py
+
+# AstroPh Dataset
+cd astroph/experiments
+python timing.py
+
+# Power Grid Dataset
+cd inf-power/experiments
+python timing.py
+
+```
+
+#### Output Format
+
+```bash
+--- Training Time Comparison ---
+Standard Training Time : 1.6s
+Watermark Training Time: 3.2s
+Overhead Factor        : 1.99x
+```
+
+### Experiment - Model Fine-Tuning Attack (Table 9)
+
+#### How to Run the Scripts
+
+```bash
+# Yeast Dataset
+cd yeast/experiments
+python finetuning.py
+python rtal.py
+
+# USAir97 Dataset
+cd usair97/experiments
+python finetuning.py
+python rtal.py
+
+# BioGRID Dataset
+cd biogrid/experiments
+python finetuning.py
+python rtal.py
+
+# AstroPh Dataset
+cd astroph/experiments
+python finetuning.py
+python rtal.py
+
+# Power Grid Dataset
+cd inf-power/experiments
+python finetuning.py
+python rtal.py
+```
+#### Output Format
+
+```bash
+--- Model Fine-Tuning ---
+No tuning   → Dtest=96.21%, Dwm=100.00%
+Tune  FTLL → Dtest=97.15%, Dwm=100.00%
+Tune  RTLL → Dtest=97.45%, Dwm=55.07%
+Tune  FTAL → Dtest=95.77%, Dwm=84.45%
+Tune  RTAL → Dtest=95.27%, Dwm=37.29%
+```
+
+### Experiment - Knowledge Distillation Attack (Table 8)
+
+#### How to Run the Scripts
+
+```bash
+# Yeast Dataset
+cd yeast/experiments
+python knowledgedistillation.py
+
+# USAir97 Dataset
+cd usair97/experiments
+python knowledgedistillation.py
+
+# BioGRID Dataset
+cd biogrid/experiments
+python knowledgedistillation.py
+
+# AstroPh Dataset
+cd astroph/experiments
+python knowledgedistillation.py
+
+# Power Grid Dataset
+cd inf-power/experiments
+python knowledgedistillation.py
+```
+#### Output Format 
+
+```bash
+--- Knowledge Distillation ---
+Distilled   → Dtest=95.90%, Dwm= 8.63%
+Knowledge Distillation: Test AUC=0.9513, WM AUC=0.0407
+```
+
+
+### Experiment - Model Pruning Attack (Table 10)
+
+#### How to Run the Scripts
+
+```bash
+# Yeast Dataset
+cd yeast/experiments
+python pruning.py
+
+# USAir97 Dataset
+cd usair97/experiments
+python pruning.py
+
+# BioGRID Dataset
+cd biogrid/experiments
+python pruning.py
+
+# AstroPh Dataset
+cd astroph/experiments
+python pruning.py
+
+# Power Grid Dataset
+cd inf-power/experiments
+python pruning.py
+```
+
+#### Output Format
+
+```bash
+--- Model Pruning ---
+Prune   0%  → Dtest=96.99%, Dwm=99.95%
+Prune  20% → Dtest=97.00%, Dwm=99.95%
+Prune  40% → Dtest=96.90%, Dwm=99.92%
+Prune  60% → Dtest=96.61%, Dwm=99.87%
+Prune  80% → Dtest=95.94%, Dwm=99.63%
+```
+
+### Experiment - Weight Quantization Attack
+
+#### How to Run the Scripts
+
+```bash
+# Yeast Dataset
+cd yeast/experiments
+python quantization.py
+
+# USAir97 Dataset
+cd ../../usair97/experiments
+python quantization.py
+
+# BioGRID Dataset
+cd ../../biogrid/experiments
+python quantization.py
+
+# AstroPh Dataset
+cd ../../astroph/experiments
+python quantization.py
+
+# Power Grid Dataset
+cd ../../inf-power/experiments
+python quantization.py
+```
+
+#### Output Format
+
+```bash
+--- Weight Quantization --- 
+Quantized   → Dtest=96.07%, Dwm=99.97%
+```
+
+
+### Experiment - Fine-Pruning with RTAL (Table 9)
+
+#### How to Run the Scripts
+
+```bash
+# Yeast Dataset
+cd yeast/experiments
+python rtal.py
+
+# USAir97 Dataset
+cd ../../usair97/experiments
+python rtal.py
+
+# BioGRID Dataset
+cd ../../biogrid/experiments
+python rtal.py
+
+# AstroPh Dataset
+cd ../../astroph/experiments
+python rtal.py
+
+# Power Grid Dataset
+cd ../../inf-power/experiments
+python rtal.py
+```
+
+#### Output Format
+
+```bash
+--- Fine-Pruning (RTAL) ---
+P+RTAL  20% → Dtest=96.01%, Dwm=12.75%
+P+RTAL  40% → Dtest=94.03%, Dwm=29.63%
+P+RTAL  60% → Dtest=95.71%, Dwm=26.18%
+P+RTAL  80% → Dtest=94.27%, Dwm=16.21%
+```
+
+### Architecture Code Execution : Watermarked Model Training & End-to-End Evaluation (Tables 4–10)
+
+For eg : The script "usair97_gcn.py" trains a watermarked GCN model on a given dataset and runs **end-to-end evaluation**, including:
+
+- Watermark embedding
+- Watermark verification (ownership check)
+- Robustness attacks (extraction, distillation, fine-tuning, pruning, quantization)
+- Timing overhead measurement
+
+#### How to Run (USAir97 example)
+
+```bash
+cd usair97
+python usair97_gcn.py
+```
+
+#### Output Format
+```bash
+Final Train AUC: 0.9981, Val AUC: 0.9493, Test AUC: 0.9700
+Watermark Verification AUC on WM Data: 0.9957
+Judge: Registered model for USAir_GCNModelOwner at timestamp=2025-02-15 19:58:45
+
+Fine-tuning attack ...
+Judge: Found record for USAir_GCNModelOwner, verifying watermark ...
+
+Watermark Verification AUC = 0.9960
+Dynamic Threshold = 0.7040
+Ownership Verified : True
+Smoothed bootstrap p-value = 0.3198
+Judge: Verified ownership for USAir_GCNModelOwner, p-value=0.3198
+```
